@@ -1,0 +1,295 @@
+name: build
+
+on:
+  pull_request:
+    paths:
+      - 'server/**'
+      - 'web/**'
+      - 'support/**'
+      - '.github/workflows/build.yml'
+  # Runs on main warm the toolchain cache for PR runs (PR-scope caches can
+  # read the default-branch scope, but never the other way around)
+  push:
+    branches: [main]
+    paths:
+      - 'server/**'
+      - 'web/**'
+      - 'support/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Base release used to backfill closed-source components (libkvm, scripts,
+  # services, DEBIAN control) into the test package. Update both together,
+  # and re-check that the base deb still has no DEBIAN/md5sums.
+  BASE_RELEASE: '1.2.15'
+  BASE_TARBALL_SHA256: '20a75e7a9573d3c57a12c5cf6340dceeedeb8690609c2e3644d0f6f16c443de7'
+  # Test version: 0.<PR>.<run> for PRs, 0.0.<run> otherwise.
+  # Always sorts below any real x.y.z release version.
+  TEST_VERSION: ${{ github.event_name == 'pull_request' && format('0.{0}.{1}', github.event.pull_request.number, github.run_number) || format('0.0.{0}', github.run_number) }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      # Upstream's `pnpm lint` caps warnings at 30 but current main has 31
+      # pre-existing warnings, so allow exactly the existing count to keep
+      # regression pressure without failing every PR. Drop --ext: it is a
+      # no-op under the flat eslint config.
+      - name: Lint
+        working-directory: web
+        run: pnpm exec eslint . --report-unused-disable-directives --max-warnings 31
+
+      - name: Build (tsc + vite)
+        working-directory: web
+        run: pnpm build
+
+      - name: Verify dist
+        working-directory: web
+        run: |
+          test -f dist/index.html
+          test -d dist/assets
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Install patchelf
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq patchelf
+
+      - name: Cache ARM toolchain
+        id: toolchain-cache
+        uses: actions/cache@v4
+        with:
+          path: support/toolchains/armv8-toolchains
+          key: armv8-toolchain-${{ hashFiles('support/scripts/config.ini', 'support/scripts/toolchain_setup.sh', 'support/scripts/getconfig.py') }}
+
+      - name: Install ARM toolchain
+        if: steps.toolchain-cache.outputs.cache-hit != 'true'
+        working-directory: support/scripts
+        run: ./toolchain_setup.sh
+
+      # toolchain.ini lives outside the cached directory and contains absolute
+      # paths, so regenerate it every run (covers both cache hit and miss).
+      - name: Generate toolchain.ini
+        run: |
+          TC="$GITHUB_WORKSPACE/support/toolchains/armv8-toolchains"
+          test -x "$TC/bin/aarch64-none-linux-gnu-gcc"
+          mkdir -p support/toolchains
+          cat > support/toolchains/toolchain.ini <<EOF
+          [toolchain]
+          cc = $TC/bin/aarch64-none-linux-gnu-gcc
+          cxx = $TC/bin/aarch64-none-linux-gnu-g++
+          ld = $TC/bin/aarch64-none-linux-gnu-ld
+          EOF
+
+      - name: Build server
+        working-directory: server
+        run: |
+          echo "$TEST_VERSION" > version.txt
+          bash build.sh
+
+      # Intermediate files avoid grep -q closing pipes early: under the
+      # step-level pipefail a SIGPIPE'd producer fails the gate spuriously
+      - name: Verify binary
+        working-directory: server
+        run: |
+          set -x
+          file NanoKVM-Server > /tmp/file.out
+          grep -q 'aarch64' /tmp/file.out
+
+          readelf -d NanoKVM-Server > /tmp/dynamic.out
+          grep -E 'RPATH|RUNPATH' /tmp/dynamic.out > /tmp/rpath.out
+          grep -qF "\$ORIGIN/dl_lib" /tmp/rpath.out
+
+          # go version -m cannot parse the binary after patchelf rewrites the
+          # ELF layout, so check for BoringCrypto symbols instead
+          strings NanoKVM-Server > /tmp/server-strings.out
+          grep -q '_goboringcrypto_' /tmp/server-strings.out || {
+            echo '::error::BoringCrypto symbols not found in binary'
+            exit 1
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-binary
+          path: server/NanoKVM-Server
+          if-no-files-found: error
+          retention-days: 1
+
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [web, server]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: server-binary
+          path: artifacts/server
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: artifacts/web
+
+      - name: Fetch base release
+        run: |
+          curl -fL --retry 3 --retry-all-errors --retry-delay 5 -o base.tar.gz \
+            "https://github.com/sipeed/NanoKVM-Pro/releases/download/${BASE_RELEASE}/nanokvm_pro_${BASE_RELEASE}.tar.gz"
+          echo "${BASE_TARBALL_SHA256}  base.tar.gz" | sha256sum -c -
+          tar xzf base.tar.gz
+
+          # Verify the inner deb against its manifest (sha512 is base64-encoded)
+          cd "nanokvm_pro_${BASE_RELEASE}"
+          expected=$(jq -r .sha512 "nanokvmpro_${BASE_RELEASE}.json")
+          actual=$(openssl dgst -sha512 -binary "nanokvmpro_${BASE_RELEASE}_arm64.deb" | base64 -w0)
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::base deb sha512 mismatch: expected $expected got $actual"
+            exit 1
+          fi
+
+      - name: Repack test deb
+        run: |
+          set -euo pipefail
+          BASE_DEB="nanokvm_pro_${BASE_RELEASE}/nanokvmpro_${BASE_RELEASE}_arm64.deb"
+
+          dpkg-deb -R "$BASE_DEB" pkg
+
+          # Swap in freshly built server binary and web dist; everything else
+          # (libkvm, scripts, services, DEBIAN maintainer scripts) stays from
+          # the base release
+          install -m 755 artifacts/server/NanoKVM-Server pkg/kvmapp/server/NanoKVM-Server
+          rm -rf pkg/kvmapp/server/web
+          mkdir -p pkg/kvmapp/server/web
+          cp -a artifacts/web/. pkg/kvmapp/server/web/
+          printf '%s\n' "$TEST_VERSION" > pkg/kvmapp/version
+          sed -i "s/^Version: .*/Version: ${TEST_VERSION}/" pkg/DEBIAN/control
+          # Make the provenance unmistakable: this is a CI test build, not a
+          # Sipeed release
+          sed -i "s|^Description: .*|Description: UNOFFICIAL CI TEST BUILD ${TEST_VERSION} (${GITHUB_REPOSITORY} run ${GITHUB_RUN_ID}), not a Sipeed release|" pkg/DEBIAN/control
+
+          # -Zxz: match the base release format; runner default (zstd) may not
+          # be supported by the device's dpkg
+          dpkg-deb --root-owner-group -Zxz -b pkg "nanokvmpro_${TEST_VERSION}_arm64.deb"
+
+      - name: Verify test deb
+        run: |
+          set -euo pipefail
+          NEW_DEB="nanokvmpro_${TEST_VERSION}_arm64.deb"
+          BASE_DEB="nanokvm_pro_${BASE_RELEASE}/nanokvmpro_${BASE_RELEASE}_arm64.deb"
+
+          dpkg-deb -I "$NEW_DEB" > new.info
+          cat new.info
+          grep -q "Version: ${TEST_VERSION}" new.info
+          grep -q 'UNOFFICIAL CI TEST BUILD' new.info
+
+          # List once to files: grep -q at the end of a dpkg-deb pipe triggers
+          # SIGPIPE on tar under pipefail
+          dpkg-deb -c "$BASE_DEB" > base_full.lst
+          dpkg-deb -c "$NEW_DEB" > new_full.lst
+
+          # Payload (path, mode, owner) must be identical to the base deb
+          # outside web assets, whose hashed filenames legitimately change.
+          # The version file changes content but keeps path/mode/owner, so it
+          # stays out of this diff by design. Strip symlink targets first so
+          # links are compared by their own path, not their destination.
+          sed 's/ -> .*//' base_full.lst | awk '{print $6, $1, $2}' | grep -v '/kvmapp/server/web/' | sort > base.lst
+          sed 's/ -> .*//' new_full.lst | awk '{print $6, $1, $2}' | grep -v '/kvmapp/server/web/' | sort > new.lst
+          diff -u base.lst new.lst
+
+          # libkvm symlink chain must survive the repack
+          grep 'dl_lib/libkvm.so ' new_full.lst > /tmp/libkvm-link.out
+          grep -q '^l' /tmp/libkvm-link.out
+          grep -q 'dl_lib/libkvm.so.0.1.0' new_full.lst
+
+          # Server binary must be present, regular file, mode 755
+          grep 'server/NanoKVM-Server$' new_full.lst > /tmp/server-entry.out
+          grep -q '^-rwxr-xr-x' /tmp/server-entry.out
+
+          # Web dist must actually be inside the package (the payload diff
+          # above excludes web paths, so assert presence explicitly)
+          grep -q 'server/web/index.html$' new_full.lst
+          asset_count=$(grep -c 'server/web/assets/' new_full.lst)
+          if [ "$asset_count" -lt 10 ]; then
+            echo "::error::web assets missing or truncated (found ${asset_count} entries)"
+            exit 1
+          fi
+
+      - name: Write build info and checksums
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || 'n/a' }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          NEW_DEB="nanokvmpro_${TEST_VERSION}_arm64.deb"
+          sha256sum "$NEW_DEB" > sha256.txt
+
+          cat > BUILD_INFO.txt <<EOF
+          version: ${TEST_VERSION}
+          event: ${EVENT_NAME}
+          repo: ${REPO}
+          source_sha: ${SOURCE_SHA}
+          pr_head_sha: ${PR_HEAD_SHA}
+          run_id: ${RUN_ID}
+          run_attempt: ${RUN_ATTEMPT}
+          base_release: ${BASE_RELEASE}
+          base_tarball_sha256: ${BASE_TARBALL_SHA256}
+          EOF
+          cat BUILD_INFO.txt sha256.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nanokvmpro-deb-${{ env.TEST_VERSION }}-run${{ github.run_id }}-attempt${{ github.run_attempt }}
+          path: |
+            nanokvmpro_*_arm64.deb
+            sha256.txt
+            BUILD_INFO.txt
+          if-no-files-found: error
+          retention-days: ${{ github.event_name == 'pull_request' && 7 || 90 }}
